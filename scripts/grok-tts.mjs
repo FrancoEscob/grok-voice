@@ -393,7 +393,7 @@ const HELP = `grok-tts: speech from a Grok subscription, or from XAI_API_KEY.
   grok-tts voices
   grok-tts logout
 
-Inline tags: [pause] [long-pause] <slow>…</slow> <fast>…</fast> <soft>…</soft> <whisper>…</whisper> [laugh] [breath]`;
+Speech tags (square brackets vs <whisper>…</whisper>): https://docs.x.ai/developers/model-capabilities/audio/text-to-speech#speech-tags`;
 
 async function main() {
 	const [command, ...rest] = process.argv.slice(2);

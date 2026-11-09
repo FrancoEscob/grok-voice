@@ -55,7 +55,9 @@ Defaults: voice `eve`, language `auto`, speed 1, WAV 48 kHz. For Spanish pass `-
 
 Also: `--speed` (0.7–1.5), `--style=soft` or `slow+soft` (wraps the text in `<soft>` / `<slow>`), `--replace=Alumni=Álumni` (repeatable).
 
-Inside the text, use sparingly: `[pause]` `[long-pause]` `[laugh]` `[chuckle]` `[breath]` `<slow>` `<fast>` `<soft>` `<whisper>`. `<emphasis>` barely does anything.
+Speech tags go inside `text`. Before writing any, read https://docs.x.ai/developers/model-capabilities/audio/text-to-speech#speech-tags and use only tags from that section.
+
+Two shapes. A point in the sentence is square brackets, as in `[pause]` or `[laugh]`. A stretch of words is a wrapping tag with a closing tag, as in `<whisper>a secret</whisper>`, `<soft>`, `<slow>`, or `<singing>`. Whisper is `<whisper>`, not `[whisper]`. Wrap a whole phrase. Do not stack several inline tags in a row. That page has the full list and a sample of each.
 
 Cap: 60,000 characters per request. Split longer text into sentences.
 
@@ -86,6 +88,6 @@ Errors: 401, log in again. 403, stop and tell the person this subscription did n
 
 Official docs show an API key in the examples. A SuperGrok OAuth bearer from this login returned audio on both `POST /v1/tts` and the WebSocket (checked 2026-10-12). A 403 means that account is outside that result. API list price, when xAI bills the call that way: 15 USD per million characters.
 
-Full tag, language, and codec list: https://docs.x.ai/developers/model-capabilities/audio/text-to-speech
+Languages, codecs, and pronunciation (`replace`, IPA) are on that same page: https://docs.x.ai/developers/model-capabilities/audio/text-to-speech
 
 Do not put the bearer in a browser. The app process requests the audio.
