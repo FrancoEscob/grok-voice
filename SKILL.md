@@ -1,14 +1,15 @@
 ---
 name: grok-tts
 description: >
-  Generate spoken audio with the user's own Grok subscription (device OAuth, no API key)
-  or with an xAI API key. Use for TTS, voiceover, narration, voces, locución, or to call
-  Grok/xAI text-to-speech from a script or an app. Also when the user runs /grok-tts.
+  Speak and transcribe with the user's own Grok subscription (device OAuth, no API key)
+  or with an xAI API key. Use for TTS, STT, voiceover, narration, dictation, voces,
+  locución, transcripción, or to call Grok/xAI text-to-speech and speech-to-text
+  from a script or an app. Also when the user runs /grok-tts.
 ---
 
 # Grok TTS
 
-Speech with the Grok account of whoever is at this machine. One browser approval. The token stays on their disk.
+Speech and transcription with the Grok account of whoever is at this machine. One browser approval covers both. The token stays on their disk.
 
 CLI: `scripts/grok-tts.mjs` next to this file. Node 20 or newer. ffmpeg only to transcode or to measure duration.
 
@@ -37,7 +38,7 @@ Show the person the URL and the code as soon as they print. Wait until login exi
 
 Session file: `~/.config/grok-tts/auth.json` (mode 600). Do not print it, commit it, copy it from another machine, or read `~/.grok/auth.json`.
 
-If `XAI_API_KEY` is set, the CLI uses it. A 403 on the subscription token means this account did not get TTS. Stop and say so. Do not switch to an API key unless the person asks.
+If `XAI_API_KEY` is set, the CLI uses it. A 403 on the subscription token means this account did not get that voice call. Stop and say so. Do not switch to an API key unless the person asks.
 
 ## Audio files
 
@@ -61,7 +62,21 @@ Two shapes. A point in the sentence is square brackets, as in `[pause]` or `[lau
 
 Cap: 60,000 characters per request. Split longer text into sentences.
 
-From Node, import `synthesize` and `getAccessToken` from the script. `synthesize` returns `{ audio, params }` with WAV bytes.
+From Node, import `synthesize`, `transcribeFile`, and `getAccessToken` from the script. `synthesize` returns `{ audio, params }` with WAV bytes. `transcribeFile` returns the JSON from `POST /v1/stt`.
+
+## Transcribe a file
+
+```bash
+node "$GROK_TTS" transcribe audio.mp3
+node "$GROK_TTS" transcribe note.wav --language=es --format
+node "$GROK_TTS" transcribe note.wav --language=es --keyterm=Mars --diarize --json
+```
+
+Stdout is the transcript. `--json` prints the full response (`text`, `language`, `duration`, `words` with start and end). `--format` writes numbers and amounts as digits and needs `--language`. `--diarize` adds a speaker on each word. `--filler-words` keeps "eh" and "um". Repeat `--keyterm` for names the model should prefer.
+
+Give the CLI a container: wav, mp3, m4a, ogg, opus, flac, webm, or mp4. Max 500 MB. It does not send raw PCM.
+
+Languages, diarization, and the streaming query names: https://docs.x.ai/developers/model-capabilities/audio/speech-to-text
 
 ## In an app
 
@@ -84,10 +99,26 @@ Live reading, the way a "read this selection" feature works:
 
 `wss://api.x.ai/v1/tts?language=es-ES&voice=carina&codec=pcm&sample_rate=48000` with the same Bearer. Send `{"type":"text.delta","delta":"..."}` then `{"type":"text.done"}`. The server sends `audio.delta` (base64) and `audio.done`. Cancel with `{"type":"text.clear"}`. Pronunciations for the connection, before any text: `{"type":"session.update","replace":{"Alumni":"Álumni"}}`, then wait for `session.updated`.
 
-Errors: 401, log in again. 403, stop and tell the person this subscription did not get TTS. 404, unknown voice; list voices. 429 or 5xx, retry a few times with backoff.
+Errors for speech: 401, log in again. 403, stop and tell the person this subscription did not get that call. 404, unknown voice; list voices. 429 or 5xx, retry a few times with backoff.
 
-Official docs show an API key in the examples. A SuperGrok OAuth bearer from this login returned audio on both `POST /v1/tts` and the WebSocket (checked 2026-10-12). A 403 means that account is outside that result. API list price, when xAI bills the call that way: 15 USD per million characters.
+Official docs show an API key in the examples. A SuperGrok OAuth bearer from this login returned audio on both `POST /v1/tts` and the TTS WebSocket (checked 2026-10-12). The same bearer is what a dictation app uses for `wss://api.x.ai/v1/stt`. A 403 means that account is outside that result. TTS list price, when xAI bills that call that way: 15 USD per million characters.
 
-Languages, codecs, and pronunciation (`replace`, IPA) are on that same page: https://docs.x.ai/developers/model-capabilities/audio/text-to-speech
+Languages, codecs, and pronunciation (`replace`, IPA): https://docs.x.ai/developers/model-capabilities/audio/text-to-speech
 
-Do not put the bearer in a browser. The app process requests the audio.
+### Transcribe
+
+File: `POST https://api.x.ai/v1/stt` as `multipart/form-data`, with the same Bearer. Put every field before `file`. The server can ignore fields that arrive after the file. Send `model` as `grok-voice-transcribe-2.0`. Optional: `language`, `format` (needs `language`), `diarize`, `filler_words`, and `keyterm` repeated once per name. The JSON response has `text`, `language`, `duration`, and `words` (each word has `start` and `end`; `speaker` when you asked for diarization). Containers are detected. Raw PCM also needs `audio_format` and `sample_rate`. Max 500 MB.
+
+Live dictation, the shape of a hold-to-talk app:
+
+`wss://api.x.ai/v1/stt?model=grok-voice-transcribe-2.0&encoding=pcm&sample_rate=16000&interim_results=true&language=es`
+
+Wait for `{"type":"transcript.created"}` before any audio. Then send raw PCM, 16-bit little-endian, mono, as binary frames. About 100 ms per frame is 3200 bytes at 16 kHz. Do not base64-encode the audio.
+
+`transcript.partial` is a line of text. `is_final` false means those words can still change. `is_final` true and `speech_final` false means that chunk is locked and the person is still going. Both true means they paused and the utterance is done. On a push-to-talk release, send `{"type":"finalize"}` and keep the socket. When the session is over, send `{"type":"audio.done"}`, wait for `transcript.done`, and close.
+
+The microphone stays in the app. Opus packets, smart turn, and one transcript per channel are query options on the speech-to-text page. Read them there instead of inventing names: https://docs.x.ai/developers/model-capabilities/audio/speech-to-text
+
+STT errors: 401, log in again. 403, stop. 400, the form or the query is wrong (`format` without `language` is a common one). 413, the file is over 500 MB. 429 or 5xx, retry a few times.
+
+Do not put the bearer in a browser. The app process opens the HTTP call and the socket.

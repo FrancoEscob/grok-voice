@@ -11,6 +11,7 @@
 //                              [--style=soft] [--replace=Alumni=Álumni]
 //   grok-tts batch lines.json [--out=dir] [--only=a,b] [--force]
 //   grok-tts voices
+//   grok-tts transcribe audio.mp3 [--language=es] [--format] [--diarize] [--json]
 //   grok-tts logout
 //
 // batch reads [{ "id", "text", "voice"?, "language"?, "speed"?, "style"?, "replace"? }]
@@ -24,7 +25,7 @@ import { execFile, spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
 import { chmod, mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, extname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
@@ -41,6 +42,8 @@ const AUTH_PATH = process.env.GROK_TTS_AUTH ?? join(homedir(), ".config", "grok-
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
 const OUTPUT_FORMAT = { codec: "wav", sample_rate: 48_000 };
 const MAX_CHARS = 60_000;
+const MAX_STT_BYTES = 500 * 1024 * 1024;
+const STT_MODEL = "grok-voice-transcribe-2.0";
 
 export const DEFAULTS = Object.freeze({ voice: "eve", language: "auto", speed: 1 });
 
@@ -264,6 +267,42 @@ export async function listVoices() {
 	return voices ?? [];
 }
 
+/** Transcribe a container file (wav, mp3, m4a, …). Returns the JSON from POST /v1/stt. */
+export async function transcribeFile(file, { language, format = false, diarize = false, fillerWords = false, keyterms = [] } = {}) {
+	if (format && !language) throw new Error("--format needs --language.");
+	const info = await stat(file);
+	if (!info.isFile()) throw new Error(`${file} is not a file.`);
+	if (info.size > MAX_STT_BYTES) throw new Error("File is over 500 MB.");
+	const bytes = await readFile(file);
+	const name = basename(file);
+	for (let attempt = 0; ; attempt++) {
+		const form = new FormData();
+		form.append("model", STT_MODEL);
+		if (language) form.append("language", language);
+		if (format) form.append("format", "true");
+		if (diarize) form.append("diarize", "true");
+		if (fillerWords) form.append("filler_words", "true");
+		for (const term of keyterms) form.append("keyterm", term);
+		form.append("file", new Blob([bytes]), name);
+		const token = await getAccessToken();
+		const response = await fetch(`${API_BASE}/stt`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}` },
+			body: form,
+		});
+		if (response.ok) return response.json();
+		if (response.status === 401 || response.status === 403)
+			throw new AuthError(`xAI rejected the credential (${response.status}): ${await apiError(response)}. Run: grok-tts login`);
+		if ((response.status === 429 || response.status >= 500) && attempt < 4) {
+			const wait = 2 ** attempt * 1500;
+			console.warn(`  xAI responded ${response.status}; retry in ${wait / 1000}s`);
+			await sleep(wait);
+			continue;
+		}
+		throw new Error(`xAI /stt failed (${response.status}): ${await apiError(response)}`);
+	}
+}
+
 async function durationOf(path) {
 	try {
 		const { stdout } = await execFileAsync("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]);
@@ -292,11 +331,15 @@ async function saveAudio(audio, file) {
 }
 
 function parseArgs(argv) {
-	const opts = { positional: [], replace: {}, force: false, open: true };
+	const opts = { positional: [], replace: {}, keyterms: [], force: false, open: true };
 	for (let i = 0; i < argv.length; i++) {
 		const arg = argv[i];
 		if (arg === "--force") opts.force = true;
 		else if (arg === "--no-open") opts.open = false;
+		else if (arg === "--format") opts.format = true;
+		else if (arg === "--json") opts.json = true;
+		else if (arg === "--diarize") opts.diarize = true;
+		else if (arg === "--filler-words") opts.fillerWords = true;
 		else if (arg === "-o") opts.out = argv[++i];
 		else if (arg.startsWith("--")) {
 			const [key, ...rest] = arg.slice(2).split("=");
@@ -305,7 +348,8 @@ function parseArgs(argv) {
 			if (key === "replace") {
 				const [from, ...to] = value.split("=");
 				opts.replace[from] = to.join("=");
-			} else if (key === "speed") opts.speed = Number(value);
+			} else if (key === "keyterm") opts.keyterms.push(value);
+			else if (key === "speed") opts.speed = Number(value);
 			else if (key === "only") opts.only = new Set(value.split(",").map((s) => s.trim()).filter(Boolean));
 			else if (["voice", "language", "style", "out"].includes(key)) opts[key] = value;
 			else throw new Error(`Unknown option: --${key}`);
@@ -376,6 +420,20 @@ async function cmdBatch(opts) {
 	console.log(`Manifest: ${manifestPath} (${manifest.totalDuration}s total)`);
 }
 
+async function cmdTranscribe(opts) {
+	const file = opts.positional[0];
+	if (!file) throw new Error("Missing audio file.");
+	const result = await transcribeFile(resolve(file), {
+		language: opts.language,
+		format: opts.format,
+		diarize: opts.diarize,
+		fillerWords: opts.fillerWords,
+		keyterms: opts.keyterms,
+	});
+	if (opts.json) console.log(JSON.stringify(result, null, 2));
+	else console.log(result.text ?? "");
+}
+
 async function cmdStatus() {
 	if (process.env.XAI_API_KEY) return console.log("Using XAI_API_KEY from the environment.");
 	const cred = await readCredential();
@@ -384,16 +442,18 @@ async function cmdStatus() {
 	console.log(minutes > 0 ? `Session saved. Access token expires in ${minutes} min and refreshes on use.` : "Session saved. Access token expired; it refreshes on use.");
 }
 
-const HELP = `grok-tts: speech from a Grok subscription, or from XAI_API_KEY.
+const HELP = `grok-tts: speech and transcription with a Grok subscription, or with XAI_API_KEY.
 
   grok-tts login [--no-open]
   grok-tts status
   grok-tts say "text" [-o out.wav|.mp3] [--voice=${DEFAULTS.voice}] [--language=${DEFAULTS.language}] [--speed=1] [--style=soft] [--replace=From=To]
   grok-tts batch lines.json [--out=dir] [--only=a,b] [--force]
   grok-tts voices
+  grok-tts transcribe audio.mp3 [--language=es] [--format] [--diarize] [--filler-words] [--keyterm=Name] [--json]
   grok-tts logout
 
-Speech tags (square brackets vs <whisper>…</whisper>): https://docs.x.ai/developers/model-capabilities/audio/text-to-speech#speech-tags`;
+Speech tags: https://docs.x.ai/developers/model-capabilities/audio/text-to-speech#speech-tags
+Transcription: https://docs.x.ai/developers/model-capabilities/audio/speech-to-text`;
 
 async function main() {
 	const [command, ...rest] = process.argv.slice(2);
@@ -406,6 +466,7 @@ async function main() {
 	}
 	if (command === "say") return cmdSay(opts);
 	if (command === "batch") return cmdBatch(opts);
+	if (command === "transcribe") return cmdTranscribe(opts);
 	if (command === "voices") {
 		for (const v of await listVoices()) console.log(`${String(v.voice_id).padEnd(12)} ${v.gender ?? ""}\t${v.language ?? ""}\t${v.description ?? ""}`);
 		return;
