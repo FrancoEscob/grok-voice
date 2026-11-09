@@ -1,0 +1,7 @@
+node_modules/
+*.wav
+*.mp3
+*.m4a
+*.ogg
+auth.json
+.DS_Store
