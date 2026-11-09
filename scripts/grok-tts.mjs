@@ -19,7 +19,7 @@
 // when its text or options changed (or always with --force).
 //
 // From another script:
-//   import { synthesize, getAccessToken } from "./grok-tts.mjs";
+//   import { synthesize, transcribeFile, getAccessToken } from "./grok-tts.mjs";
 
 import { execFile, spawn } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
@@ -143,14 +143,17 @@ function openBrowser(url) {
 }
 
 /** Valid access token. XAI_API_KEY wins when set. Otherwise the saved session, refreshed if needed. */
-export async function getAccessToken() {
+export async function getAccessToken({ forceRefresh = false } = {}) {
 	if (process.env.XAI_API_KEY) return process.env.XAI_API_KEY;
 	const cred = await readCredential();
 	if (!cred) throw new AuthError("No xAI session. Run: grok-tts login");
-	if (Date.now() < cred.expires) return cred.access;
+	if (!forceRefresh && Date.now() < cred.expires) return cred.access;
 	return withLock(async () => {
 		const current = await readCredential();
-		if (current && Date.now() < current.expires) return current.access;
+		if (!current) throw new AuthError("No xAI session. Run: grok-tts login");
+		// Another process may have refreshed while we waited for the lock.
+		if (current.access !== cred.access && Date.now() < current.expires) return current.access;
+		if (!forceRefresh && Date.now() < current.expires) return current.access;
 		const response = await postForm(TOKEN_URL, { grant_type: "refresh_token", client_id: CLIENT_ID, refresh_token: current.refresh });
 		if (!response.ok) {
 			const detail = [response.body.error, response.body.error_description].filter(Boolean).join(": ");
@@ -206,19 +209,30 @@ async function apiError(response) {
 	}
 }
 
+// 401 refreshes the session once and retries. 403 means this account did not get that call.
 async function xai(path, init = {}) {
-	for (let attempt = 0; ; attempt++) {
-		const token = await getAccessToken();
+	for (let attempt = 0, refreshed = false; ; attempt++) {
+		const token = await getAccessToken({ forceRefresh: refreshed && attempt === 1 });
 		const response = await fetch(`${API_BASE}${path}`, {
 			...init,
 			headers: { Authorization: `Bearer ${token}`, ...(init.headers ?? {}) },
 		});
 		if (response.ok) return response;
-		if (response.status === 401 || response.status === 403)
-			throw new AuthError(`xAI rejected the credential (${response.status}): ${await apiError(response)}. Run: grok-tts login`);
+		if (response.status === 401 && !refreshed && !process.env.XAI_API_KEY) {
+			refreshed = true;
+			attempt = 0;
+			await response.body?.cancel().catch(() => {});
+			continue;
+		}
+		if (response.status === 401)
+			throw new AuthError(`xAI rejected the credential (401): ${await apiError(response)}. Run: grok-tts login`);
+		if (response.status === 403)
+			throw new AuthError(`xAI refused ${path} for this account (403): ${await apiError(response)}. This subscription did not get that call; logging in again will not change it.`);
 		if ((response.status === 429 || response.status >= 500) && attempt < 4) {
-			const wait = 2 ** attempt * 1500;
+			const retryAfter = Number(response.headers.get("retry-after"));
+			const wait = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 60) * 1000 : 2 ** attempt * 1500;
 			console.warn(`  xAI responded ${response.status}; retry in ${wait / 1000}s`);
+			await response.body?.cancel().catch(() => {});
 			await sleep(wait);
 			continue;
 		}
@@ -273,34 +287,16 @@ export async function transcribeFile(file, { language, format = false, diarize =
 	const info = await stat(file);
 	if (!info.isFile()) throw new Error(`${file} is not a file.`);
 	if (info.size > MAX_STT_BYTES) throw new Error("File is over 500 MB.");
-	const bytes = await readFile(file);
-	const name = basename(file);
-	for (let attempt = 0; ; attempt++) {
-		const form = new FormData();
-		form.append("model", STT_MODEL);
-		if (language) form.append("language", language);
-		if (format) form.append("format", "true");
-		if (diarize) form.append("diarize", "true");
-		if (fillerWords) form.append("filler_words", "true");
-		for (const term of keyterms) form.append("keyterm", term);
-		form.append("file", new Blob([bytes]), name);
-		const token = await getAccessToken();
-		const response = await fetch(`${API_BASE}/stt`, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${token}` },
-			body: form,
-		});
-		if (response.ok) return response.json();
-		if (response.status === 401 || response.status === 403)
-			throw new AuthError(`xAI rejected the credential (${response.status}): ${await apiError(response)}. Run: grok-tts login`);
-		if ((response.status === 429 || response.status >= 500) && attempt < 4) {
-			const wait = 2 ** attempt * 1500;
-			console.warn(`  xAI responded ${response.status}; retry in ${wait / 1000}s`);
-			await sleep(wait);
-			continue;
-		}
-		throw new Error(`xAI /stt failed (${response.status}): ${await apiError(response)}`);
-	}
+	const form = new FormData();
+	// Fields first: the server can ignore fields that arrive after the file.
+	form.append("model", STT_MODEL);
+	if (language) form.append("language", language);
+	if (format) form.append("format", "true");
+	if (diarize) form.append("diarize", "true");
+	if (fillerWords) form.append("filler_words", "true");
+	for (const term of keyterms) form.append("keyterm", term);
+	form.append("file", new Blob([await readFile(file)]), basename(file));
+	return (await xai("/stt", { method: "POST", body: form })).json();
 }
 
 async function durationOf(path) {
@@ -340,7 +336,10 @@ function parseArgs(argv) {
 		else if (arg === "--json") opts.json = true;
 		else if (arg === "--diarize") opts.diarize = true;
 		else if (arg === "--filler-words") opts.fillerWords = true;
-		else if (arg === "-o") opts.out = argv[++i];
+		else if (arg === "-o") {
+			opts.out = argv[++i];
+			if (!opts.out) throw new Error("-o needs a file path.");
+		} else if (arg === "-h" || arg === "--help") opts.help = true;
 		else if (arg.startsWith("--")) {
 			const [key, ...rest] = arg.slice(2).split("=");
 			const value = rest.join("=");
@@ -349,7 +348,10 @@ function parseArgs(argv) {
 				const [from, ...to] = value.split("=");
 				opts.replace[from] = to.join("=");
 			} else if (key === "keyterm") opts.keyterms.push(value);
-			else if (key === "speed") opts.speed = Number(value);
+			else if (key === "speed") {
+				opts.speed = Number(value);
+				if (!(opts.speed >= 0.7 && opts.speed <= 1.5)) throw new Error("--speed must be a number from 0.7 to 1.5.");
+			}
 			else if (key === "only") opts.only = new Set(value.split(",").map((s) => s.trim()).filter(Boolean));
 			else if (["voice", "language", "style", "out"].includes(key)) opts[key] = value;
 			else throw new Error(`Unknown option: --${key}`);
@@ -375,7 +377,10 @@ async function readStdin() {
 
 async function cmdSay(opts) {
 	let text = opts.positional.join(" ");
-	if (!text || text === "-") text = await readStdin();
+	if (!text || text === "-") {
+		if (process.stdin.isTTY) throw new Error('Missing text. Use: grok-tts say "text" or pipe it with say -');
+		text = await readStdin();
+	}
 	const file = resolve(opts.out ?? `grok-tts-${new Date().toISOString().replace(/[:.]/g, "-")}.wav`);
 	const { audio, params } = await synthesize({ text, ...lineOptions(opts) });
 	await saveAudio(audio, file);
@@ -389,6 +394,11 @@ async function cmdBatch(opts) {
 	const lines = JSON.parse(await readFile(input, "utf8"));
 	if (!Array.isArray(lines)) throw new Error(`${input} must be an array of lines.`);
 	for (const line of lines) if (!line?.id || !line?.text) throw new Error(`Line missing id or text: ${JSON.stringify(line)}`);
+	const ids = new Set();
+	for (const { id } of lines) {
+		if (ids.has(id)) throw new Error(`Duplicate line id: ${id}`);
+		ids.add(id);
+	}
 	const unknown = [...(opts.only ?? [])].filter((id) => !lines.some((l) => l.id === id));
 	if (unknown.length) throw new Error(`--only ids that do not exist: ${unknown.join(", ")}`);
 
@@ -396,6 +406,8 @@ async function cmdBatch(opts) {
 	const manifestPath = join(outDir, "manifest.json");
 	const manifest = existsSync(manifestPath) ? JSON.parse(await readFile(manifestPath, "utf8")) : {};
 	manifest.lines ??= {};
+	// Lines removed from the script drop out of the manifest and the total.
+	for (const id of Object.keys(manifest.lines)) if (!ids.has(id)) delete manifest.lines[id];
 
 	for (const line of lines) {
 		if (opts.only && !opts.only.has(line.id)) continue;
@@ -415,8 +427,10 @@ async function cmdBatch(opts) {
 		manifest.lines[line.id].duration = await durationOf(file);
 	}
 	manifest.format = OUTPUT_FORMAT;
+	manifest.order = lines.map((l) => l.id);
 	manifest.totalDuration = Math.round(Object.values(manifest.lines).reduce((sum, l) => sum + (l.duration ?? 0), 0) * 1000) / 1000;
-	await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+	await writeFile(`${manifestPath}.tmp`, `${JSON.stringify(manifest, null, 2)}\n`);
+	await rename(`${manifestPath}.tmp`, manifestPath);
 	console.log(`Manifest: ${manifestPath} (${manifest.totalDuration}s total)`);
 }
 
@@ -458,6 +472,7 @@ Transcription: https://docs.x.ai/developers/model-capabilities/audio/speech-to-t
 async function main() {
 	const [command, ...rest] = process.argv.slice(2);
 	const opts = parseArgs(rest);
+	if (opts.help) return console.log(HELP);
 	if (command === "login") return login({ openBrowser: opts.open });
 	if (command === "status") return cmdStatus();
 	if (command === "logout") {
@@ -472,6 +487,10 @@ async function main() {
 		return;
 	}
 	console.log(HELP);
+	if (command && command !== "help") {
+		console.error(`\nUnknown command: ${command}`);
+		process.exitCode = 1;
+	}
 }
 
 const invokedDirectly = (() => {
